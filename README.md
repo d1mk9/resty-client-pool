@@ -76,7 +76,6 @@ func New(cfg config.Config) *ClientPool
   - `MaxIdleConnsPerHost: 1`,
   - `MaxIdleConns: Size * 2`,
   - опционально `ResponseHeaderTimeout`.
-- Явно отключаем HTTP/2 через `TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{}` — чтобы в сценариях с L4 балансировщиком гарантировать **несколько отдельных HTTP/1.1 каналов**, а не мультиплекс на одном H2-соединении.
 
 ### Round-robin
 
