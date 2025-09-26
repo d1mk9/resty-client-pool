@@ -1,20 +1,19 @@
-package restypool
+package fiberpool
 
 import (
 	"context"
 	"httpclientpool/pkg/config"
 	"httpclientpool/pkg/pool"
 	"httpclientpool/pkg/rr"
-
 	"sync"
 
-	resty "resty.dev/v3"
+	fibercli "github.com/gofiber/fiber/v3/client"
 )
 
 var _ pool.Client = (*ClientPool)(nil)
 
 type ClientPool struct {
-	clients   []*resty.Client
+	clients   []*fibercli.Client
 	spin      rr.RR
 	cfg       config.Config
 	closeOnce sync.Once
@@ -24,36 +23,34 @@ func New(cfg config.Config) *ClientPool {
 	if cfg.Size <= 0 {
 		cfg.Size = config.DefaultConfig().Size
 	}
-
-	cs := make([]*resty.Client, 0, cfg.Size)
+	cs := make([]*fibercli.Client, 0, cfg.Size)
 	for i := 0; i < cfg.Size; i++ {
-		cs = append(cs, newRestyClient(cfg))
+		cs = append(cs, newFiberClient(cfg))
 	}
 	return &ClientPool{clients: cs, cfg: cfg}
 }
 
 func (p *ClientPool) Get(ctx context.Context, path string) (pool.Response, error) {
 	i := p.spin.Next(len(p.clients))
-	rr, err := p.clients[i].R().SetContext(ctx).Get(path)
+	res, err := p.clients[i].Get(path)
 	if err != nil {
 		return nil, err
 	}
-	return newRestyResp(rr), nil
+	return newFiberResp(res), nil
 }
 
 func (p *ClientPool) Post(ctx context.Context, path string, body any) (pool.Response, error) {
 	i := p.spin.Next(len(p.clients))
-	rr, err := p.clients[i].R().SetContext(ctx).SetBody(body).Post(path)
+	res, err := p.clients[i].Post(path, fibercli.Config{
+		Body: body,
+	})
 	if err != nil {
 		return nil, err
 	}
-	return newRestyResp(rr), nil
+	return newFiberResp(res), nil
 }
 
 func (p *ClientPool) Close() {
 	p.closeOnce.Do(func() {
-		for _, c := range p.clients {
-			_ = c.Close()
-		}
 	})
 }

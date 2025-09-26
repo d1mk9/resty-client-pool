@@ -1,13 +1,19 @@
-# resty-client-pool
+# http-client-pool (resty + fiber)
 
-Пул клиентов на базе resty, который **создаёт несколько независимых TCP/TLS-соединений** к одному и тому же хосту и **распределяет запросы по ним round-robin’ом**. Это помогает уйти от ситуации, когда один keep-alive канал «прилипает» к одному pod’у/инстансу за балансировщиком.
+Пулы HTTP-клиентов для **распараллеливания запросов на один и тот же хост**.  
+Идея: создать **N независимых TCP/TLS-соединений** и раздавать запросы по ним **round-robin** — чтобы не «прилипать» одним keep-alive к одному pod’у/инстансу за балансировщиком.
+
+Поддержаны 2 клиента:
+- **Resty** (`net/http`)
+- **Fiber client** (`fasthttp`)
 
 ---
 
 ## Зачем это нужно
 
-- **Один `http.Transport` ⇢ одно/несколько keep-alive соединений.** Если у вас один клиент, он может всё время ходить в один и тот же pod.
-- **Пул из N клиентов** с `MaxConnsPerHost=1` у каждого даёт **N отдельных TCP/TLS-соединений**, и мы прокручиваем их **round-robin**.
+- У одного клиента (`http.Transport`) обычно **несколько keep-alive коннектов**, но в реальности часто «залипаем» на одном и том же pod’е.
+- **Пул из N клиентов** с `MaxConnsPerHost=1` у каждого даёт **минимум N отдельных TCP/TLS-каналов**, а RR равномерно распределяет запросы.
+- Это снижает риск «перегреть» один pod и помогает балансировке.
 
 ---
 
@@ -15,127 +21,96 @@
 
 `pkg/config/config.go`
 
-- `BaseURL string`  
-  Базовый адрес. Все пути в `Get/Post` считаются относительными от него. Можно оставить пустым и передавать абсолютные URL в каждом вызове.
-- `Size int`  
-  Размер пула, **сколько клиентов / TCP-соединений** создаём. По умолчанию `8`.
-- `RequestTimeout time.Duration`  
-  **Глобальный таймаут запроса** в resty: включает TCP-connect, TLS-handshake, отправку, ожидание заголовков и чтение тела.
-- `DialTimeout time.Duration`  
-  Сколько ждём **установку TCP-соединения** (3-way handshake) до падения с timeout.
-- `TlsTimeout time.Duration`  
-  Сколько ждём **TLS-рукопожатие** после успешного TCP-connect.
-- `IdleConnTimeout time.Duration`  
-  Сколько держим **keep-alive** соединение открытым, если им никто не пользуется.
-- `MaxConnsPerHost int`  
-  Лимит соединений на хост внутри одного `http.Transport`. В нашем пуле **ставим `1`** на каждого клиента, чтобы гарантировать по одному соединению на клиента.
-- `InsecureSkipVerify bool`  
-  Пропуск верификации TLS-сертификата (только для локальных тестов/стендов). **В проде держите `false`.**
-- `ResponseHeaderTimeout time.Duration`  
-  Сколько ждём **первые байты заголовков ответа** после полной отправки запроса. Полезно, чтобы не висеть на сервере, который «молчит».
-
-### Почему именно такие поля
-
-- Мы контролируем **все этапы жизненного цикла запроса**: соединение, TLS, ожидание начала ответа и глобальный дедлайн.
-- Отдельный таймаут на idle помогает держать пул «здоровым» и не скапливать старые каналы.
-- `MaxConnsPerHost=1` — ключ к идее пула: **1 клиент = 1 TCP-канал**. N клиентов ⇒ N каналов.
+- `BaseURL string` — Базовый URL. Пути в `Get`/`Post` считаются относительными. Можно оставить пустым и передавать абсолютные URL.
+- `Size int` — Размер пула (**сколько клиентов/соединений** создаём). По умолчанию `8`.
+- `RequestTimeout time.Duration`   
+  **Глобальный таймаут запроса**:
+  - Для **Resty** — от начала до конца: TCP connect, TLS, отправка, ожидание заголовков, чтение тела (необязательный,контролируется `ctx`).
+  - Для **Fiber** — применяется как `ReadTimeout`/`WriteTimeout`/`MaxConnWaitTimeout` (`ctx` нет).
+- `DialTimeout time.Duration` — Сколько ждём **установку TCP** (3-way handshake).
+- `TlsTimeout time.Duration` — Сколько ждём **TLS-рукопожатие** (только Resty/`net/http`).
+- `IdleConnTimeout time.Duration` — Сколько держим **idle (keep-alive)** соединение, если им никто не пользуется.
+- `MaxConnsPerHost int` — Лимит соединений на хост **внутри одного клиента**. В пуле ставим `1`, чтобы гарантировать **1 клиент = 1 коннект**.
+- `InsecureSkipVerify bool` — Пропуск проверки TLS-серта (**только для тестов/локалки**).
+- `ResponseHeaderTimeout time.Duration` — Сколько ждём **первые байты заголовков ответа** (только Resty/`net/http`).
 
 ---
 
-## Публичное API
+## Публичный интерфейс (общий)
 
-`pkg/restypool/pool.go`
+`pkg/pool/client.go`
 
 ```go
 type Client interface {
-    Get(ctx context.Context, path string) (*resty.Response, error)
-    Post(ctx context.Context, path string, body any) (*resty.Response, error)
-    Close() error
+    Get(ctx context.Context, path string) (Response, error)
+    Post(ctx context.Context, path string, body any) (Response, error)
+    Close()
 }
 
-func New(cfg config.Config) *ClientPool
+type Response interface {
+    StatusCode() int
+    Body() []byte
+}
 ```
-
-- `New(cfg)` — создаёт пул из `cfg.Size` клиентов. Каждый клиент имеет свой `http.Transport` с `MaxConnsPerHost=1`.
-- `Get/Post` — выбирают клиента **round-robin** и выполняют запрос (путь конкатенируется с `BaseURL` если он задан).
-- `Close()` — idempotent; закрывает всех клиентов пула.
 
 ---
 
-## Внутреннее устройство
+## Таймлайн запроса
 
-### Транспорт
+### Resty (`net/http`)
 
-`pkg/restypool/client.go`:
+**Холодный запрос:**
+1. TCP connect — `DialTimeout` + общий `RequestTimeout`
+2. TLS handshake — `TlsTimeout` + общий `RequestTimeout`
+3. Запись запроса — общий `RequestTimeout`
+4. Ожидание заголовков — `ResponseHeaderTimeout` + общий `RequestTimeout`
+5. Чтение тела — общий `RequestTimeout`
+6. Idle — соединение остаётся до `IdleConnTimeout`
 
-- Создаём `*http.Transport` с:
-  - `DialContext` (таймаут установки TCP),
-  - `TLSHandshakeTimeout`,
-  - `IdleConnTimeout`,
-  - `MaxConnsPerHost: 1`,
-  - `MaxIdleConnsPerHost: 1`,
-  - `MaxIdleConns: Size * 2`,
-  - опционально `ResponseHeaderTimeout`.
+**Keep-alive:** шаги 1-2 пропускаются.
 
-### Round-robin
+### Fiber (`fasthttp`)
 
-Простейший атомарный счётчик на `atomic.Uint64`:
+- TCP connect — `DialTimeout`
+- TLS — в рамках `RequestTimeout` (через Read/WriteTimeout)
+- Idle — управляется `MaxIdleConnDuration`
+- Нет ResponseHeaderTimeout и per-request context
 
-```
-i := counter.Add(1)
-idx := (i-1) % len(clients)
-```
 
-### Keep-alive
-
-Используем стандартное поведение `http.Transport`: соединения живут и переиспользуются до `IdleConnTimeout`, что экономит RTT (нет лишних TCP+TLS рукопожатий).
 
 ---
 
 ## Тесты
 
-`pkg/restypool/pool_test.go`:
+Есть два набора:
 
-- **Юнит-тесты на хэндлере `httptest.Server`**
-  - `TestPool_Get_Post` — базовая корректность.
-  - `TestPool_ContextTimeout_Get` — падение по таймауту контекста.
-  - `TestPool_ContextCancel_Get` — отмена контекста.
-  - `TestPool_Parallel_NoRace` — конкурентный доступ к пулу.
-  - `TestPool_Close_Idempotent` — повторный `Close()` безопасен.
-  - `TestPool_BaseURL_Join` — корректное склеивание `BaseURL` и `path`.
-  - `TestPool_ResponseHeaderTimeout` — таймаут на заголовки.
-  - `TestPool_DefaultSize` — подставляет значение по умолчанию.
-  - `TestPool_DistributesAcrossConnections` — **основной тест для ТЗ**: сервер логирует `RemoteAddr`, мы убеждаемся, что запросы приходят **с разных локальных сокетов**, т.е. пул действительно держит **несколько TCP-каналов**.
+- `pkg/restypool/pool_test.go` — юнит-тесты Resty-пула
+- `pkg/pool/client_suite_test.go` — общий suite для Resty и Fiber (учитывает различия в поддержке контекста и ResponseHeaderTimeout)
 
-Запуск:
+---
 
-```bash
-go test ./... -v -race
+## Бенчмарки
+
+Результаты (M4, macOS):
+
+```
+BenchmarkPools_Small
+BenchmarkPools_Small/resty/small-10         	   30957	     38678 ns/op	    8453 B/op	      94 allocs/op
+BenchmarkPools_Small/fiber/small-10         	   31162	     38616 ns/op	    5388 B/op	      78 allocs/op
+
+BenchmarkPools_Large
+BenchmarkPools_Large/resty/large-10         	    2817	    389401 ns/op	 2141373 B/op	     130 allocs/op
+BenchmarkPools_Large/fiber/large-10         	    2996	    350101 ns/op	 1329366 B/op	     102 allocs/op
 ```
 
----
-
-## Алгоритм работы (коротко)
-
-1. На старте создаём `Size` клиентов. У каждого — свой `http.Transport` с `MaxConnsPerHost=1`.
-2. При каждом `Get/Post`:
-   - выбираем индекс `i` по round-robin,
-   - берём клиента `clients[i]`,
-   - выполняем запрос (относительный путь приклеивается к `BaseURL`).
-3. `http.Transport` сам поддерживает keep-alive и реюз соединений.
-4. `Close()` закрывает всех клиентов (и их транспорты) один раз.
+**Выводы:**
+- На маленьких ответах Resty и Fiber примерно одинаковые по скорости.
+- Fiber требует меньше памяти и делает меньше аллокаций.
+- На больших ответах Fiber быстрее и экономичнее.
 
 ---
 
-## Ограничения и заметки
+## Ограничения
 
-- `InsecureSkipVerify=true` — **только для локальных тестов**. В продакшене — выключить.
-- Если нужен универсальный интерфейс под несколько HTTP-клиентов (resty/fiber), можно вынести дженерик-интерфейс и адаптеры отдельно.
-
----
-
-## Дальше по плану
-
-- Конфиг из YAML/ENV (через `viper`).
-- Универсализировать под разные HTTP-клиенты
----
+- Fiber-пул не поддерживает отмену per-request `ctx`.
+- Resty умеет всё (`ctx`, ResponseHeaderTimeout).
